@@ -115,7 +115,7 @@ create_pipes(int **pipes_fds, size_t cmd_count)
 }
 
 static struct exec_result
-execute_logical_operand(struct expr *pipeline_start, size_t cmd_count,
+execute_pipeline(struct expr *pipeline_start, size_t cmd_count,
 	const char *out_file, enum output_type out_type, int need_wait)
 {
 	assert(pipeline_start != NULL);
@@ -263,74 +263,90 @@ execute_logical_operand(struct expr *pipeline_start, size_t cmd_count,
 }
 
 static struct exec_result
+execute_logical_operand(struct expr *start, const char *out_file,
+	enum output_type out_type, int need_wait)
+{
+	assert(start != NULL);
+
+	size_t cmd_count = 0;
+	struct expr *iter = start;
+
+	while (iter != NULL) {
+		switch (iter->type) {
+		case EXPR_TYPE_AND:
+		case EXPR_TYPE_OR: {
+			return execute_pipeline(start, cmd_count, out_file, out_type, need_wait);
+		}
+
+		case EXPR_TYPE_COMMAND: {
+			++cmd_count;
+			break;
+		}
+
+		default: {
+			break;
+		}
+		}
+
+		iter = iter->next;
+	}
+
+	return execute_pipeline(start, cmd_count, out_file, out_type, need_wait);
+}
+
+static int
+is_expr_logical(const struct expr *e)
+{
+	assert(e != NULL);
+	return e->type == EXPR_TYPE_AND || e->type == EXPR_TYPE_OR;
+}
+
+static struct exec_result
 execute_command_line(const struct command_line *line)
 {
 	assert(line != NULL);
 
 	struct expr *iter = line->head;
-	struct exec_result line_result = make_result(0, 0, NULL, 0);
+	struct expr *operand_start = iter;
+	while (iter != NULL && !is_expr_logical(iter)) {
+		iter = iter->next;
+	}
+
+	int is_last = (iter == NULL);
+	struct exec_result prev_result = execute_logical_operand(operand_start,
+		is_last ? line->out_file : NULL,
+		is_last ? line->out_type : OUTPUT_TYPE_STDOUT,
+		is_last ? (line->is_background == 0) : 1
+	);
+	if (prev_result.need_exit) {
+		return prev_result;
+	}
 
 	while (iter != NULL) {
-		size_t cmd_count = 0;
-		enum expr_type logical_op_found = 0;
-		struct expr *pipe_start = iter;
+		enum expr_type op = iter->type;
+		iter = iter->next;
 
-		while (iter != NULL && (logical_op_found != EXPR_TYPE_AND && logical_op_found != EXPR_TYPE_OR)) {
-			switch (iter->type) {
-			case EXPR_TYPE_COMMAND: {
-				++cmd_count;
+		if ((op == EXPR_TYPE_AND && prev_result.return_code == 0) ||
+			(op == EXPR_TYPE_OR && prev_result.return_code != 0)) {
+			operand_start = iter;
+
+			while (iter != NULL && !is_expr_logical(iter)) {
 				iter = iter->next;
-				break;
 			}
 
-			case EXPR_TYPE_AND:
-			case EXPR_TYPE_OR: {
-				logical_op_found = iter->type;
-				break;
+			is_last = (iter == NULL);
+			prev_result = execute_logical_operand(operand_start,
+				is_last ? line->out_file : NULL,
+				is_last ? line->out_type : OUTPUT_TYPE_STDOUT,
+				is_last ? (line->is_background == 0) : 1
+			);
+			if (prev_result.need_exit) {
+				return prev_result;
 			}
-
-			default: {
-				iter = iter->next;
-				break;
-			}
-			}
-		}
-
-		struct exec_result res = execute_logical_operand(pipe_start, cmd_count,
-			iter == NULL ? line->out_file : NULL, line->out_type, iter == NULL ? (line->is_background == 0) : 1);
-
-		if (res.need_exit) {
-			return res;
-		}
-
-		switch (logical_op_found) {
-		case EXPR_TYPE_AND: {
-			if (res.return_code != 0) {
-				return res;
-			}
-
-			line_result = res;
-			iter = iter->next;
-			break;
-		}
-
-		case EXPR_TYPE_OR: {
-			if (res.return_code == 0) {
-				return res;
-			}
-
-			line_result = res;
-			iter = iter->next;
-			break;
-		}
-
-		default: {
-			return res;
-		}
 		}
 	}
 
-	return line_result;
+	return prev_result;
 }
 
 int
