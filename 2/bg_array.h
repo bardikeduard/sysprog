@@ -57,7 +57,7 @@ bg_array_realloc(struct bg_array *arr)
 	return 0;
 }
 
-static inline void
+static inline int
 bg_array_wait_nonblock(struct bg_array *arr)
 {
 	assert(arr != NULL);
@@ -74,6 +74,8 @@ bg_array_wait_nonblock(struct bg_array *arr)
 			++i;
 		}
 	}
+
+	return bg_array_realloc(arr);
 }
 
 static inline int

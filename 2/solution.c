@@ -174,78 +174,71 @@ execute_pipeline(struct expr *pipeline_start, size_t cmd_count,
 		}
 		else {
 			pid_t child_pid = fork();
-			switch (child_pid) {
-				case -1: {
-					puts("fork error\n");
-					close_pipes(pipes_fds + 1, 2 * (cmd_count - 1));
-					free(pipes_fds);
-					wait_children_and_free(children_pids, child_size);
 
-					return make_result(1, 1, children_pids, child_size);
-				}
+			if (child_pid == -1) {
+				puts("fork error\n");
 
-				case 0: {
-					free(children_pids);
+				close_pipes(pipes_fds + 1, 2 * (cmd_count - 1));
+				free(pipes_fds);
+				wait_children_and_free(children_pids, child_size);
 
-					for (size_t fd_idx = 1; fd_idx < 2 * cmd_count - 1; ++fd_idx) {
-						if (fd_idx != 2 * i + 1 && fd_idx != 2 * i) {
-							close(pipes_fds[fd_idx]);
-						}
-					}
+				return make_result(1, 1, children_pids, child_size);
+			}
 
-					if (need_wait != 0 || i != 0) {
-						if (dup2(pipes_fds[2 * i], STDIN_FILENO) != STDIN_FILENO) {
-							puts("dup2 error\n");
+			if (child_pid == 0) {
+				free(children_pids);
 
-							close(pipes_fds[2 * i]);
-							close(pipes_fds[2 * i + 1]);
-							free(pipes_fds);
-
-							return make_result(1, 0, NULL, 0);
-						}
-					}
-					else {
-						close(STDIN_FILENO);
-					}
-
-					int out_fd = pipes_fds[2 * i + 1];
-					if (out_type != OUTPUT_TYPE_STDOUT && out_file != NULL && i == cmd_count - 1) {
-						out_fd = open(out_file,
-							O_CREAT | O_WRONLY | (out_type == OUTPUT_TYPE_FILE_NEW ? O_TRUNC : O_APPEND),
-							S_IRWXU | S_IRWXG | S_IRWXO
-						);
-						if (out_fd == -1) {
-							puts("out file open error\n");
-
-							close(pipes_fds[2 * i]);
-							close(pipes_fds[2 * i + 1]);
-							free(pipes_fds);
-
-							return make_result(1, 0, NULL, 0);
-						}
-					}
-
-					if (dup2(out_fd, STDOUT_FILENO) != STDOUT_FILENO) {
+				if (need_wait != 0 || i != 0) {
+					if (dup2(pipes_fds[2 * i], STDIN_FILENO) != STDIN_FILENO) {
 						puts("dup2 error\n");
 
-						close(pipes_fds[2 * i]);
-						close(pipes_fds[2 * i + 1]);
+						close_pipes(pipes_fds, cmd_count);
 						free(pipes_fds);
 
 						return make_result(1, 0, NULL, 0);
 					}
+				}
+				else {
+					close(STDIN_FILENO);
+				}
 
+				int out_fd = pipes_fds[2 * i + 1];
+				if (i == cmd_count - 1 && out_type != OUTPUT_TYPE_STDOUT && out_file != NULL) {
+					out_fd = open(out_file,
+						O_CREAT | O_WRONLY | (out_type == OUTPUT_TYPE_FILE_NEW ? O_TRUNC : O_APPEND),
+						S_IRWXU | S_IRWXG | S_IRWXO
+					);
+					if (out_fd == -1) {
+						puts("out file open error\n");
+
+						close_pipes(pipes_fds, cmd_count);
+						free(pipes_fds);
+
+						return make_result(1, 0, NULL, 0);
+					}
+				}
+
+				if (dup2(out_fd, STDOUT_FILENO) != STDOUT_FILENO) {
+					puts("dup2 error\n");
+
+					close_pipes(pipes_fds, cmd_count);
 					free(pipes_fds);
 
-					execute_cmd(expression);
 					return make_result(1, 0, NULL, 0);
 				}
 
-				default: {
-					children_pids[child_size++] = child_pid;
-					break;
+				for (size_t fd_idx = 1; fd_idx < 2 * cmd_count - 1; ++fd_idx) {
+					if (fd_idx != 2 * i + 1 && fd_idx != 2 * i) {
+						close(pipes_fds[fd_idx]);
+					}
 				}
+				free(pipes_fds);
+
+				execute_cmd(expression);
+				return make_result(1, 0, NULL, 0);
 			}
+
+			children_pids[child_size++] = child_pid;
 		}
 
 		expression = expression->next;
@@ -359,7 +352,11 @@ main(void)
 	int last_retcode = 0;
 
 	struct bg_array bg_proc;
-	bg_array_init(&bg_proc);
+	if (bg_array_init(&bg_proc) != 0) {
+		puts("bg_array_init error\n");
+		parser_delete(p);
+		return 1;
+	}
 
 	while ((rc = read(STDIN_FILENO, buf, buf_size)) > 0) {
 		parser_feed(p, buf, rc);
@@ -379,13 +376,18 @@ main(void)
 
 			if (result.bg_pids != NULL) {
 				for (size_t i = 0; i < result.bg_count; ++i) {
-					bg_array_push(&bg_proc, result.bg_pids[i]);
+					if (bg_array_push(&bg_proc, result.bg_pids[i]) != 0) {
+						puts("bg_array_push error\n");
+						break;
+					}
 				}
 
 				free(result.bg_pids);
 			}
 
-			bg_array_wait_nonblock(&bg_proc);
+			if (bg_array_wait_nonblock(&bg_proc) != 0) {
+				puts("bg_array_wait_nonblock error\n");
+			}
 
 			if (result.need_exit != 0) {
 				bg_array_free(&bg_proc);
