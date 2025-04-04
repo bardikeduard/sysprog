@@ -3,6 +3,9 @@
 
 #include <stdlib.h>
 #include <pthread.h>
+#include <errno.h>
+
+#define NSEC_PER_SEC 1000000000
 
 enum task_state {
 	TASK_CREATED,
@@ -196,8 +199,10 @@ thread_pool_delete(struct thread_pool *pool)
 
 	for (int i = 0; i < pool->max_thread_count && pool->threads[i] != NULL; ++i) {
 		pthread_join(pool->threads[i]->thread, NULL);
+		free(pool->threads[i]);
 	}
 
+	free(pool->threads);
 	task_vector_delete(&pool->tasks_queue);
 	pthread_mutex_destroy(&pool->queue_mutex);
 	pthread_cond_destroy(&pool->queue_cond);
@@ -304,7 +309,7 @@ thread_task_join(struct thread_task *task, void **result)
 	}
 
 	pthread_mutex_unlock(&task->mutex);
-	task->state = TASK_CREATED;
+	set_task_status(task, TASK_CREATED);
 	*result = task->result;
 
 	return 0;
@@ -315,11 +320,41 @@ thread_task_join(struct thread_task *task, void **result)
 int
 thread_task_timed_join(struct thread_task *task, double timeout, void **result)
 {
-	/* IMPLEMENT THIS FUNCTION */
-	(void)task;
-	(void)timeout;
-	(void)result;
-	return TPOOL_ERR_NOT_IMPLEMENTED;
+	if (get_task_status(task) == TASK_CREATED) {
+		return TPOOL_ERR_TASK_NOT_PUSHED;
+	}
+
+	struct timespec ts;
+	if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+		return TPOOL_ERR_UNKNOWN;
+	}
+
+	long long timeout_nsec = (long)(timeout * NSEC_PER_SEC);
+	ts.tv_sec += timeout_nsec / NSEC_PER_SEC;
+	ts.tv_nsec += timeout_nsec % NSEC_PER_SEC;
+
+	if (ts.tv_nsec >= NSEC_PER_SEC) {
+		ts.tv_nsec -= NSEC_PER_SEC;
+		ts.tv_sec += 1;
+	}
+
+	pthread_mutex_lock(&task->mutex);
+
+	int ret_code = pthread_cond_timedwait(&task->cond, &task->mutex, &ts);
+	while (ret_code == 0 && get_task_status(task) != TASK_FINISHED) {
+		ret_code = pthread_cond_timedwait(&task->cond, &task->mutex, &ts);
+	}
+
+	if (ret_code == ETIMEDOUT) {
+		pthread_mutex_unlock(&task->mutex);
+		return TPOOL_ERR_TIMEOUT;
+	}
+
+	pthread_mutex_unlock(&task->mutex);
+	set_task_status(task, TASK_CREATED);
+	*result = task->result;
+
+	return 0;
 }
 
 #endif
