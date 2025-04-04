@@ -15,7 +15,7 @@
  * It is important to define these macros here, in the header, because it is
  * used by tests.
  */
-#define NEED_DETACH 0
+#define NEED_DETACH 1
 #define NEED_TIMED_JOIN 0
 
 struct thread_pool;
@@ -28,7 +28,7 @@ enum {
 	TPOOL_MAX_TASKS = 100000,
 };
 
-enum thread_poool_errcode {
+enum thread_pool_errcode {
 	TPOOL_ERR_INVALID_ARGUMENT = 1,
 	TPOOL_ERR_TOO_MANY_TASKS,
 	TPOOL_ERR_HAS_TASKS,
@@ -36,6 +36,7 @@ enum thread_poool_errcode {
 	TPOOL_ERR_TASK_IN_POOL,
 	TPOOL_ERR_NOT_IMPLEMENTED,
 	TPOOL_ERR_TIMEOUT,
+	TPOOL_ERR_UNKNOWN,
 };
 
 /** Thread pool API. */
