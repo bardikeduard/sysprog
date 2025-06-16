@@ -44,6 +44,9 @@ struct chat_server {
 	/** Array of received msgs. */
 	struct array feed_root;
 
+	/** Array of server feed msgs. */
+	struct array server_feed_root;
+
 	/** Epoll file descriptor. */
 	int epoll_fd;
 
@@ -66,6 +69,12 @@ chat_server_new(void)
 
 	rlist_create(&server->peer_root);
 	if (array_init(&server->feed_root) != 0) {
+		free(server);
+		return NULL;
+	}
+
+	if (array_init(&server->server_feed_root) != 0) {
+		array_free(&server->feed_root);
 		free(server);
 		return NULL;
 	}
@@ -105,6 +114,13 @@ chat_server_delete(struct chat_server *server)
 		rlist_del_entry(client, node);
 		chat_peer_delete(server, client);
 	}
+
+	while (server->server_feed_root.a_size > 0) {
+		chat_message_delete(array_at(&server->server_feed_root, 0));
+		array_pop(&server->server_feed_root, 0);
+	}
+
+	array_free(&server->server_feed_root);
 
 	close(server->epoll_fd);
 	array_free(&server->feed_root);
@@ -506,7 +522,11 @@ chat_server_update(struct chat_server *server, double timeout)
 		}
 
 		case 0: {
-			return CHAT_ERR_TIMEOUT;
+			if (server->server_feed_root.a_size == 0) {
+				return CHAT_ERR_TIMEOUT;
+			}
+
+			break;
 		}
 
 		default: {
@@ -539,6 +559,22 @@ chat_server_update(struct chat_server *server, double timeout)
 		}
 	}
 
+	while (server->server_feed_root.a_size > 0) {
+		struct chat_message *msg = array_at(&server->server_feed_root, 0);
+		if (msg == NULL) {
+			array_pop(&server->server_feed_root, 0);
+			continue;
+		}
+
+		int rc = chat_server_broadcast(server, NULL, msg);
+		chat_message_delete(msg);
+		if (rc != 0) {
+			return rc;
+		}
+
+		array_pop(&server->server_feed_root, 0);
+	}
+
 	return 0;
 }
 
@@ -564,6 +600,10 @@ chat_server_get_socket(const struct chat_server *server)
 int
 chat_server_get_events(const struct chat_server *server)
 {
+	if (server->server_feed_root.a_size > 0) {
+		return CHAT_EVENT_INPUT | CHAT_EVENT_OUTPUT;
+	}
+
 	struct chat_peer *peer;
 	rlist_foreach_entry(peer, &server->peer_root, node) {
 		if (peer->msgs_to_write.a_size > 0) {
@@ -617,14 +657,15 @@ chat_server_feed(struct chat_server *server, const char *msg, uint32_t msg_size)
 		memcpy(buff + server->feed_buffer_len, msg + current_start, delim - msg - current_start);
 		buff[buff_size] = '\0';
 
-		struct chat_message result;
-		result.data = buff;
+		struct chat_message *result = calloc(1, sizeof(struct chat_message));
+		if (result == NULL) {
+			return CHAT_ERR_SYS;
+		}
 
-		int rc = chat_server_broadcast(server, NULL, &result);
-		free(buff);
+		result->data = buff;
 
-		if (rc != 0) {
-			return rc;
+		if (array_push(&server->server_feed_root, result) != 0) {
+			return CHAT_ERR_SYS;
 		}
 
 		current_start = delim - msg + 1;
