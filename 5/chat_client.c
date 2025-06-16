@@ -291,7 +291,7 @@ chat_client_output(struct chat_client *client)
 			return CHAT_ERR_SYS;
 		}
 
-		if (bytes_sent < message_len) {
+		if ((size_t) bytes_sent < message_len) {
 			memmove(msg->data, msg->data + bytes_sent, message_len - bytes_sent + 1);
 			return 0;
 		}

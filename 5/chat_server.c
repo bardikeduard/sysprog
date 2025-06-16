@@ -295,7 +295,7 @@ chat_server_try_send(struct chat_peer *client)
 		// was sending message body
 		if (msg->data != NULL) {
 			// sent fully
-			if (sent == source_len) {
+			if ((size_t) sent == source_len) {
 				// was sending message text
 				if (strlen(msg->data) > 0) {
 					msg->data[0] = '\0';
@@ -312,7 +312,7 @@ chat_server_try_send(struct chat_peer *client)
 			return 0;
 		}
 
-		if (sent == source_len) {
+		if ((size_t) sent == source_len) {
 			chat_message_delete(msg);
 			array_pop(&client->msgs_to_write, 0);
 			continue;
@@ -443,7 +443,7 @@ chat_server_input(struct chat_server *server, struct epoll_event *evt)
 		size_t start_pos = 0;
 		size_t i = 0;
 
-		while (i < recv_bytes) {
+		while (i < (size_t) recv_bytes) {
 			if (read_buff[i] == '\n') {  // got delim between messages
 				if (append_client_buff(client, read_buff + start_pos, i - start_pos) != 0) {
 					return CHAT_ERR_SYS;
