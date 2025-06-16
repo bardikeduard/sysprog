@@ -91,3 +91,15 @@ array_pop(struct array *arr, size_t index)
 	array_realloc(arr);
 	return copy;
 }
+
+static inline arr_type
+array_at(const struct array *arr, size_t index)
+{
+	assert(arr != NULL);
+
+	if (arr->a_size <= index) {
+		return NULL;
+	}
+
+	return arr->a_elems[index];
+}

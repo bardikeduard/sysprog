@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stddef.h>
+
 /**
  * Here you should specify which features do you want to implement via macros:
  * If you want to enable author name support, do:
@@ -42,6 +44,7 @@ struct chat_message {
 #endif
 
 	/* PUT HERE OTHER MEMBERS */
+	size_t current_len;
 };
 
 /** Free message's memory. */

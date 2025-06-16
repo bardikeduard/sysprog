@@ -7,7 +7,10 @@
 #include <unistd.h>
 #include <string.h>
 #include <sys/poll.h>
-#include <sys/ioctl.h>
+#include <sys/fcntl.h>
+#include <errno.h>
+
+#define INPUT_BUFFER_INITIAL_SIZE 4096
 
 struct chat_client {
 	/** Socket connected to the server. */
@@ -21,21 +24,157 @@ struct chat_client {
 
 	/** Name of the client - deletes after send. */
 	char *name;
+
+	/** Unified input buffer for incoming data */
+	char *input_buffer;
+
+	/** Current number of bytes in input_buffer */
+	size_t input_buffer_len;
+
+	/** Total allocated size of input_buffer */
+	size_t input_buffer_capacity;
 };
+
+
+static int
+chat_client_parse_input(struct chat_client *client)
+{
+	char *current_pos = client->input_buffer;
+	size_t remaining_len = client->input_buffer_len;
+
+	while (1) {
+		char *data_end = memchr(current_pos, '\n', remaining_len);
+		if (data_end == NULL) {
+			break;
+		}
+
+		size_t data_len = data_end - current_pos;
+		size_t len_after_data = remaining_len - (data_len + 1);
+
+		if (len_after_data == 0) {
+			break;
+		}
+
+		char *author_end = memchr(data_end + 1, '\0', len_after_data);
+		if (author_end == NULL) {
+			break;
+		}
+		size_t author_len = author_end - (data_end + 1);
+
+		struct msg_node *node = calloc(1, sizeof(struct msg_node));
+		if (node == NULL) {
+			return CHAT_ERR_SYS;
+		}
+
+		node->msg = calloc(1, sizeof(struct chat_message));
+		if (node->msg == NULL) {
+			free(node);
+			return CHAT_ERR_SYS;
+		}
+
+		node->msg->data = strndup(current_pos, data_len);
+		if (node->msg->data == NULL) {
+			free(node->msg);
+			free(node);
+			return CHAT_ERR_SYS;
+		}
+
+		node->msg->author = strndup(data_end + 1, author_len);
+		if (node->msg->author == NULL) {
+			free(node->msg->data);
+			free(node->msg);
+			free(node);
+			return CHAT_ERR_SYS;
+		}
+
+		rlist_add_tail(&client->recv_list.node, &node->node);
+
+		size_t consumed_len = author_end - current_pos + 1;
+		current_pos += consumed_len;
+		remaining_len -= consumed_len;
+	}
+
+	if (current_pos != client->input_buffer) {
+		memmove(client->input_buffer, current_pos, remaining_len);
+		client->input_buffer_len = remaining_len;
+	}
+
+	return 0;
+}
+
+static int
+chat_client_input(struct chat_client *client)
+{
+	while (1) {
+		if (client->input_buffer_len == client->input_buffer_capacity) {
+			size_t new_capacity = client->input_buffer_capacity * 2;
+			char *new_buffer = realloc(client->input_buffer, new_capacity);
+			if (new_buffer == NULL) {
+				return CHAT_ERR_SYS;
+			}
+
+			client->input_buffer = new_buffer;
+			client->input_buffer_capacity = new_capacity;
+		}
+
+		ssize_t recv_bytes = recv(client->socket,
+					client->input_buffer + client->input_buffer_len,
+					client->input_buffer_capacity - client->input_buffer_len, 0);
+
+		if (recv_bytes > 0) {
+			client->input_buffer_len += recv_bytes;
+		}
+		else if (recv_bytes == 0) {
+			return CHAT_ERR_SYS;
+		}
+		else {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				break;
+			}
+
+			return CHAT_ERR_SYS;
+		}
+	}
+
+	return 0;
+}
 
 struct chat_client *
 chat_client_new(const char *name)
 {
 	struct chat_client *client = calloc(1, sizeof(*client));
+	if (client == NULL) {
+		return NULL;
+	}
+
+	if (name != NULL) {
+		size_t name_len = strlen(name);
+
+		client->name = malloc((name_len + 2) * sizeof(char));
+		if (client->name == NULL) {
+			free(client);
+			return NULL;
+		}
+
+		memcpy(client->name, name, name_len);
+		client->name[name_len] = '\n';
+		client->name[name_len + 1] = '\0';
+	}
+
 	client->socket = -1;
 
-	client->name = strdup(name);
-	if (client->name == NULL) {
+	client->input_buffer = malloc(INPUT_BUFFER_INITIAL_SIZE);
+	if (client->input_buffer == NULL) {
+		free(client->name);
 		free(client);
 		return NULL;
 	}
 
+	client->input_buffer_len = 0;
+	client->input_buffer_capacity = INPUT_BUFFER_INITIAL_SIZE;
+
 	rlist_create(&client->send_list.node);
+	rlist_create(&client->recv_list.node);
 
 	return client;
 }
@@ -43,11 +182,27 @@ chat_client_new(const char *name)
 void
 chat_client_delete(struct chat_client *client)
 {
+	if (client == NULL) {
+		return;
+	}
+
 	if (client->socket >= 0) {
 		close(client->socket);
 	}
 
+	struct msg_node *iter, *tmp;
+	rlist_foreach_entry_safe(iter, &client->send_list.node, node, tmp) {
+		chat_message_delete(iter->msg);
+		free(iter);
+	}
+
+	rlist_foreach_entry_safe(iter, &client->recv_list.node, node, tmp) {
+		chat_message_delete(iter->msg);
+		free(iter);
+	}
+
 	free(client->name);
+	free(client->input_buffer);
 	free(client);
 }
 
@@ -73,34 +228,34 @@ chat_client_connect(struct chat_client *client, const char *addr)
 	hint.ai_socktype = SOCK_STREAM;
 
 	struct addrinfo *res;
-	int rc = getaddrinfo(addr_copy, addr_delimeter + 1, &hint, &res);
-	if (rc != 0) {
+	if (getaddrinfo(addr_copy, addr_delimeter + 1, &hint, &res) != 0) {
 		free(addr_copy);
-		freeaddrinfo(res);
-		return CHAT_ERR_SYS;
-	}
-
-	struct addrinfo *iter = res;
-	for (; iter != NULL; iter = iter->ai_next) {
-		client->socket = socket(iter->ai_family, iter->ai_socktype | SOCK_NONBLOCK, iter->ai_protocol);
-		if (client->socket == -1) {
-			continue;
-		}
-
-		rc = connect(client->socket, iter->ai_addr, iter->ai_addrlen);
-		if (rc == 0) {
-			break;
-		}
-
-		free(addr_copy);
-		freeaddrinfo(res);
 		return CHAT_ERR_SYS;
 	}
 
 	free(addr_copy);
+
+	struct addrinfo *iter = res;
+	for (; iter != NULL; iter = iter->ai_next) {
+		client->socket = socket(iter->ai_family, iter->ai_socktype, iter->ai_protocol);
+		if (client->socket == -1) {
+			continue;
+		}
+
+		if (connect(client->socket, iter->ai_addr, iter->ai_addrlen) == 0) {
+			int flags = fcntl(client->socket, F_GETFL, 0);
+			fcntl(client->socket, F_SETFL, flags | O_NONBLOCK);
+			freeaddrinfo(res);
+			return 0;
+		}
+
+		close(client->socket);
+		client->socket = -1;
+	}
+
 	freeaddrinfo(res);
 
-	return 0;
+	return CHAT_ERR_SYS;
 }
 
 struct chat_message *
@@ -119,6 +274,36 @@ chat_client_pop_next(struct chat_client *client)
 	return result;
 }
 
+static int
+chat_client_output(struct chat_client *client)
+{
+	struct msg_node *msg_snd_iter, *tmp;
+
+	rlist_foreach_entry_safe (msg_snd_iter, &client->send_list.node, node, tmp) {
+		struct chat_message *msg = msg_snd_iter->msg;
+		size_t message_len = strlen(msg->data);
+		ssize_t bytes_sent = send(client->socket, msg->data, message_len, 0);
+
+		if (bytes_sent < 0) {
+			if (errno == EWOULDBLOCK || errno == EAGAIN) {
+				return 0;
+			}
+			return CHAT_ERR_SYS;
+		}
+
+		if (bytes_sent < message_len) {
+			memmove(msg->data, msg->data + bytes_sent, message_len - bytes_sent + 1);
+			return 0;
+		}
+
+		rlist_del(&msg_snd_iter->node);
+		chat_message_delete(msg);
+		free(msg_snd_iter);
+	}
+
+	return 0;
+}
+
 int
 chat_client_update(struct chat_client *client, double timeout)
 {
@@ -128,172 +313,35 @@ chat_client_update(struct chat_client *client, double timeout)
 
 	struct pollfd pfd;
 	memset(&pfd, 0, sizeof(pfd));
-
 	pfd.fd = client->socket;
 	pfd.events = chat_events_to_poll_events(chat_client_get_events(client));
 
-	switch (poll(&pfd, 1, (int) timeout * 1000)) {
-		case -1: {
-			return CHAT_ERR_SYS;
-		}
+	int poll_rc = poll(&pfd, 1, (int) (timeout * 1000));
+	if (poll_rc < 0) {
+		return CHAT_ERR_SYS;
+	}
 
-		case 0: {
-			return CHAT_ERR_TIMEOUT;
-		}
+	if (poll_rc == 0) {
+		return CHAT_ERR_TIMEOUT;
+	}
 
-		default: {
-			break;
+	if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+		return CHAT_ERR_SYS;
+	}
+
+	int rc = 0;
+	if ((pfd.revents & POLLIN) != 0) {
+		rc = chat_client_input(client);
+		if (rc == 0) {
+			rc = chat_client_parse_input(client);
 		}
 	}
 
-	if ((pfd.revents & POLLOUT) != 0) {
-		if (client->name != NULL) {
-			size_t name_full_length = strlen(client->name) + 1;
-			ssize_t name_bytes_sent = send(client->socket, client->name, name_full_length, 0);
-			if (name_bytes_sent <= 0) {
-				return CHAT_ERR_SYS;
-			}
-
-			if (name_bytes_sent != name_full_length) {
-				memmove(client->name, client->name + name_bytes_sent, sizeof(char) * (name_full_length - name_bytes_sent));
-				return 0;
-			}
-
-			free(client->name);
-			client->name = NULL;
-		}
-
-		if (!rlist_empty(&client->send_list.node)) {
-			struct msg_node *msg_snd_iter = rlist_first_entry(&client->send_list.node, struct msg_node, node);
-			struct msg_node *msg_snd_last = rlist_last_entry(&client->send_list.node, struct msg_node, node);
-
-			while (msg_snd_iter != msg_snd_last) {
-				struct msg_node *msg_snd_next = rlist_next_entry(msg_snd_iter, node);
-
-				size_t message_full_length = strlen(msg_snd_iter->msg->data);
-				ssize_t bytes_sent = send(client->socket, msg_snd_iter->msg->data, message_full_length, 0);
-
-				if (bytes_sent < 0) {
-					return CHAT_ERR_SYS;
-				}
-
-				if (bytes_sent != message_full_length) {
-					memmove(msg_snd_iter->msg->data, msg_snd_iter->msg->data + bytes_sent, sizeof(char) * (message_full_length - bytes_sent));
-					return 0;
-				}
-
-				rlist_del(&msg_snd_iter->node);
-				free(msg_snd_iter->msg->data);
-				free(msg_snd_iter->msg);
-				free(msg_snd_iter);
-
-				msg_snd_iter = msg_snd_next;
-			}
-		}
+	if (rc == 0 && (pfd.revents & POLLOUT) != 0) {
+		rc = chat_client_output(client);
 	}
 
-	if ((pfd.events & POLLIN) != 0) {
-		static ssize_t last_recv_data_size = -1;  // counter for already received data
-		static ssize_t last_recv_name_size = -1;  // nullifies at each \0 recv
-
-		int bytes_available = 0;
-		if (ioctl(client->socket, FIONREAD, &bytes_available) != 0) {
-			return CHAT_ERR_SYS;
-		}
-
-		char *read_buff = malloc(bytes_available);
-		if (read_buff == NULL) {
-			return CHAT_ERR_SYS;
-		}
-
-		ssize_t recv_bytes = recv(client->socket, read_buff, bytes_available, 0);
-		if (recv_bytes < 0) {
-			free(read_buff);
-			return CHAT_ERR_SYS;
-		}
-
-		size_t buff_iter = 0;
-		while (buff_iter < recv_bytes) {
-			struct msg_node *node_to_recv;
-
-			if (last_recv_data_size == -1 && last_recv_name_size == -1) {
-				node_to_recv = calloc(1, sizeof(struct msg_node));
-
-				if (node_to_recv == NULL) {
-					free(read_buff);
-					return CHAT_ERR_SYS;
-				}
-
-				node_to_recv->msg = calloc(1, sizeof(struct msg_node));
-				if (node_to_recv->msg == NULL) {
-					free(node_to_recv);
-					free(read_buff);
-					return CHAT_ERR_SYS;
-				}
-
-				rlist_add_tail(&client->recv_list.node, &node_to_recv->node);
-			}
-			else {
-				node_to_recv = rlist_last_entry(&client->recv_list.node, struct msg_node, node);
-			}
-
-			if (last_recv_data_size != 0) {
-				size_t available_str_size = strnlen(read_buff + buff_iter, recv_bytes - buff_iter);
-
-				if (last_recv_data_size == -1) {
-					node_to_recv->msg->data = calloc(available_str_size + 1, sizeof(char));
-					if (node_to_recv->msg->data == NULL) {
-						free(read_buff);
-						return CHAT_ERR_SYS;
-					}
-
-					memcpy(node_to_recv->msg->data, read_buff + buff_iter, available_str_size);
-				}
-				else {
-					memcpy(node_to_recv->msg->data + last_recv_data_size, read_buff + buff_iter, available_str_size);
-				}
-
-				if (read_buff[buff_iter + available_str_size] == '\0') {
-					last_recv_data_size = 0;
-				}
-				else {
-					last_recv_data_size += available_str_size;
-				}
-
-				buff_iter += available_str_size;
-			}
-			else {
-				size_t available_str_size = strnlen(read_buff + buff_iter, recv_bytes - buff_iter);
-
-				if (last_recv_name_size == -1) {
-					node_to_recv->msg->author = calloc(available_str_size + 1, sizeof(char));
-					if (node_to_recv->msg->author == NULL) {
-						free(read_buff);
-						return CHAT_ERR_SYS;
-					}
-
-					memcpy(node_to_recv->msg->author, read_buff + buff_iter, available_str_size);
-				}
-				else {
-					memcpy(node_to_recv->msg->author + last_recv_data_size, read_buff + buff_iter, available_str_size);
-				}
-
-				if (read_buff[buff_iter + available_str_size] == '\0') {
-					last_recv_data_size = -1;
-					last_recv_name_size = -1;
-				}
-				else {
-					last_recv_name_size += available_str_size;
-				}
-
-				buff_iter += available_str_size;
-			}
-		}
-
-		free(read_buff);
-	}
-
-	return 0;
+	return rc;
 }
 
 int
@@ -309,13 +357,13 @@ chat_client_get_events(const struct chat_client *client)
 		return 0;
 	}
 
-	return CHAT_EVENT_INPUT | (rlist_empty(&client->send_list.node) ? CHAT_EVENT_OUTPUT : 0);
+	return CHAT_EVENT_INPUT | (!rlist_empty(&client->send_list.node) ? CHAT_EVENT_OUTPUT : 0);
 }
 
-int
-chat_client_feed(struct chat_client *client, const char *msg, uint32_t msg_size)
+static int
+chat_client_feed_internal(struct chat_client *client, const char *msg, uint32_t msg_size)
 {
-	struct msg_node *node = calloc(1, sizeof(struct msg_node));
+	struct msg_node *node = malloc(sizeof(struct msg_node));
 	if (node == NULL) {
 		return CHAT_ERR_SYS;
 	}
@@ -326,17 +374,28 @@ chat_client_feed(struct chat_client *client, const char *msg, uint32_t msg_size)
 		return CHAT_ERR_SYS;
 	}
 
-	node->msg->data = malloc(sizeof(char) * (msg_size + 1));
+	node->msg->data = strndup(msg, msg_size);
 	if (node->msg->data == NULL) {
 		free(node->msg);
 		free(node);
 		return CHAT_ERR_SYS;
 	}
 
-	strncpy(node->msg->data, msg, msg_size);
-	node->msg->data[msg_size] = '\0';
-
-	rlist_add(&client->send_list.node, &node->node);
-
+	rlist_add_tail(&client->send_list.node, &node->node);
 	return 0;
+}
+
+int
+chat_client_feed(struct chat_client *client, const char *msg, uint32_t msg_size)
+{
+	if (client->name != NULL) {
+		if (chat_client_feed_internal(client, client->name, strlen(client->name)) != 0) {
+			return CHAT_ERR_SYS;
+		}
+
+		free(client->name);
+		client->name = NULL;
+	}
+
+	return chat_client_feed_internal(client, msg, msg_size);
 }

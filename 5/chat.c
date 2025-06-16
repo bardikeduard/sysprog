@@ -6,8 +6,11 @@
 void
 chat_message_delete(struct chat_message *msg)
 {
-	free(msg->data);
-	free(msg);
+	if (msg != NULL) {
+		free(msg->author);
+		free(msg->data);
+		free(msg);
+	}
 }
 
 int
